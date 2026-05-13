@@ -53,7 +53,7 @@ sudo pacman -S webkit2gtk-4.1 base-devel curl wget file \
 ```bash
 # 克隆项目
 git clone <repo-url>
-cd wutheringwaves-download-manager-gui
+cd wutheringwaves-download-manager
 
 # 安装前端依赖
 npm install
