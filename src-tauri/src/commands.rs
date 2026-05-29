@@ -199,18 +199,57 @@ pub async fn launch_game(
 
     #[cfg(target_os = "windows")]
     {
+        #[link(name = "shell32")]
+        extern "system" {
+            fn ShellExecuteW(
+                hwnd: *mut std::ffi::c_void,
+                lpOperation: *const u16,
+                lpFile: *const u16,
+                lpParameters: *const u16,
+                lpDirectory: *const u16,
+                nShowCmd: i32,
+            ) -> isize;
+        }
+
         if exe_path.exists() {
-            let mut cmd = std::process::Command::new(&exe_path);
-            cmd.current_dir(&path);
-            if let Some(ref mode) = dx_mode {
+            use std::os::windows::ffi::OsStrExt;
+            use std::ffi::OsStr;
+
+            let operation: Vec<u16> = OsStr::new("open").encode_wide().chain(std::iter::once(0)).collect();
+            let exe_wide: Vec<u16> = exe_path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+            let dir_wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+
+            let params_str = dx_mode.as_deref().and_then(|mode| {
                 if mode == "dx11" {
-                    cmd.arg("-dx11");
+                    Some("-dx11")
                 } else if mode == "dx12" {
-                    cmd.arg("-dx12");
+                    Some("-dx12")
+                } else {
+                    None
                 }
+            }).unwrap_or("");
+
+            let params_wide: Vec<u16> = if params_str.is_empty() {
+                Vec::new()
+            } else {
+                OsStr::new(params_str).encode_wide().chain(std::iter::once(0)).collect()
+            };
+
+            let result = unsafe {
+                ShellExecuteW(
+                    std::ptr::null_mut(),
+                    operation.as_ptr(),
+                    exe_wide.as_ptr(),
+                    if params_wide.is_empty() { std::ptr::null() } else { params_wide.as_ptr() },
+                    dir_wide.as_ptr(),
+                    1, // SW_SHOWNORMAL
+                )
+            };
+
+            // ShellExecuteW returns a value > 32 on success
+            if result as isize <= 32 {
+                return Err(format!("无法启动游戏: 错误代码 {}", result));
             }
-            cmd.spawn()
-                .map_err(|e| format!("无法启动游戏: {}", e))?;
             return Ok(serde_json::json!({ "platform": "windows", "launched": true }));
         } else {
             return Err(format!("找不到游戏可执行文件: {}", exe_path.display()));
