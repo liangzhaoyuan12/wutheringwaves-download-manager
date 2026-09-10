@@ -108,11 +108,12 @@ pub async fn start_sync(
     app_handle: tauri::AppHandle,
     game_path: Option<String>,
     server: Option<String>,
+    cdn_url: Option<String>,
 ) -> Result<String, String> {
     let path = resolve_game_path(game_path)?;
     let server = server.unwrap_or_else(|| detect_server(&path));
 
-    let mut mgr = GameManager::new(path, &server, app_handle).map_err(|e| e.to_string())?;
+    let mut mgr = GameManager::new(path, &server, app_handle, cdn_url).map_err(|e| e.to_string())?;
     mgr.sync_files(true).await.map_err(|e| e.to_string())?;
 
     Ok("同步完成".into())
@@ -123,11 +124,12 @@ pub async fn start_download(
     app_handle: tauri::AppHandle,
     game_path: Option<String>,
     server: String,
+    cdn_url: Option<String>,
 ) -> Result<String, String> {
     let path = resolve_game_path(game_path)?;
     validate_server(&server)?;
 
-    let mut mgr = GameManager::new(path, &server, app_handle).map_err(|e| e.to_string())?;
+    let mut mgr = GameManager::new(path, &server, app_handle, cdn_url).map_err(|e| e.to_string())?;
     mgr.download_full().await.map_err(|e| e.to_string())?;
 
     Ok(format!("{} 服下载完成", server))
@@ -138,11 +140,12 @@ pub async fn start_checkout(
     app_handle: tauri::AppHandle,
     game_path: Option<String>,
     server: String,
+    cdn_url: Option<String>,
 ) -> Result<String, String> {
     let path = resolve_game_path(game_path)?;
     validate_server(&server)?;
 
-    let mut mgr = GameManager::new(path, &server, app_handle).map_err(|e| e.to_string())?;
+    let mut mgr = GameManager::new(path, &server, app_handle, cdn_url).map_err(|e| e.to_string())?;
     mgr.checkout(&server, true)
         .await
         .map_err(|e| e.to_string())?;
@@ -155,11 +158,12 @@ pub async fn start_predownload(
     app_handle: tauri::AppHandle,
     game_path: Option<String>,
     server: Option<String>,
+    cdn_url: Option<String>,
 ) -> Result<String, String> {
     let path = resolve_game_path(game_path)?;
     let server = server.unwrap_or_else(|| detect_server(&path));
 
-    let mut mgr = GameManager::new(path, &server, app_handle).map_err(|e| e.to_string())?;
+    let mut mgr = GameManager::new(path, &server, app_handle, cdn_url).map_err(|e| e.to_string())?;
     mgr.download_predownload()
         .await
         .map_err(|e| e.to_string())?;
@@ -172,11 +176,12 @@ pub async fn start_update(
     app_handle: tauri::AppHandle,
     game_path: Option<String>,
     server: Option<String>,
+    cdn_url: Option<String>,
 ) -> Result<String, String> {
     let path = resolve_game_path(game_path)?;
     let server = server.unwrap_or_else(|| detect_server(&path));
 
-    let mut mgr = GameManager::new(path, &server, app_handle).map_err(|e| e.to_string())?;
+    let mut mgr = GameManager::new(path, &server, app_handle, cdn_url).map_err(|e| e.to_string())?;
     mgr.update_game().await.map_err(|e| e.to_string())?;
 
     Ok("更新完成".into())
@@ -273,9 +278,19 @@ pub async fn delete_game(
     game_path: Option<String>,
 ) -> Result<String, String> {
     let path = resolve_game_path(game_path)?;
-    let mut mgr = GameManager::new(path.clone(), "cn", app_handle).map_err(|e| e.to_string())?;
+    let mut mgr = GameManager::new(path.clone(), "cn", app_handle, None).map_err(|e| e.to_string())?;
     mgr.delete_all_files().await.map_err(|e| e.to_string())?;
     Ok("游戏已删除".into())
+}
+
+#[tauri::command]
+pub async fn get_cdn_list(
+    server: String,
+) -> Result<Vec<crate::manager::CdnNode>, String> {
+    validate_server(&server)?;
+    GameManager::fetch_cdn_list(&server)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

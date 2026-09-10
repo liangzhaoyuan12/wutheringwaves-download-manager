@@ -17,6 +17,48 @@ const running = ref(false);
 const theme = ref("system"); // "system" | "dark" | "light"
 const dxMode = ref(""); // "" | "dx11" | "dx12"
 
+// ── CDN ──
+const cdnNodes = ref([]); // 可选 CDN 节点列表
+const cdnUrl = ref(""); // 当前选中的 CDN 基址 URL
+const cdnDropdownOpen = ref(false);
+const cdnDropdownRef = ref(null);
+
+function cdnHost(url) {
+  try { return new URL(url).host; } catch (_) { return url; }
+}
+
+function currentCdnLabel() {
+  const n = cdnNodes.value.find((x) => x.url === cdnUrl.value);
+  if (!n) return cdnUrl.value || "未选择";
+  return cdnHost(n.url) + (n.recommended ? " (推荐)" : "");
+}
+
+function selectCdn(n) {
+  cdnUrl.value = n.url;
+  localStorage.setItem("cdn:" + server.value, n.url);
+  cdnDropdownOpen.value = false;
+}
+
+// 获取当前服务器对应的 CDN 列表，默认选中推荐（优先级最高）节点，
+// 但若用户此前手动选过则保留其选择。
+async function loadCdnList() {
+  try {
+    const list = await invoke("get_cdn_list", { server: server.value });
+    cdnNodes.value = list;
+    const saved = localStorage.getItem("cdn:" + server.value);
+    const recommended = list.find((n) => n.recommended) || list[0];
+    if (saved && list.some((n) => n.url === saved)) {
+      cdnUrl.value = saved;
+    } else {
+      cdnUrl.value = recommended ? recommended.url : "";
+    }
+  } catch (e) {
+    addLog("获取 CDN 列表失败: " + e, "error");
+    cdnNodes.value = [];
+    cdnUrl.value = "";
+  }
+}
+
 function applyTheme(t) {
   theme.value = t;
   const isDark = t === "dark" || (t === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
@@ -40,6 +82,7 @@ const servers = [
 function selectServer(s) {
   server.value = s.key;
   dropdownOpen.value = false;
+  loadCdnList();
 }
 
 const currentServerLabel = computed(() => {
@@ -83,6 +126,9 @@ onMounted(async () => {
   onUnmounted(() => document.removeEventListener("click", onDocumentClick));
 
   if (gamePath.value) await refreshStatus();
+
+  // 拉取默认服务器的 CDN 列表
+  loadCdnList();
 });
 
 function onDocumentClick(e) {
@@ -91,6 +137,9 @@ function onDocumentClick(e) {
   }
   if (dxDropdownRef.value && !dxDropdownRef.value.contains(e.target)) {
     dxDropdownOpen.value = false;
+  }
+  if (cdnDropdownRef.value && !cdnDropdownRef.value.contains(e.target)) {
+    cdnDropdownOpen.value = false;
   }
 }
 
@@ -126,7 +175,10 @@ async function refreshStatus() {
     status.value = result;
     if (result.server && result.server !== "未知") {
       const srv = servers.find((s) => s.key === result.server);
-      if (srv) server.value = srv.key;
+      if (srv && srv.key !== server.value) {
+        server.value = srv.key;
+        loadCdnList();
+      }
     }
   } catch (e) {
     addLog("获取状态失败: " + e, "error");
@@ -144,7 +196,7 @@ async function selectPath() {
 async function startSync() {
   await withRunning(async () => {
     addLog("开始检验游戏完整性...", "info");
-    await invoke("start_sync", { gamePath: gamePath.value || undefined, server: server.value });
+    await invoke("start_sync", { gamePath: gamePath.value || undefined, server: server.value, cdnUrl: cdnUrl.value || undefined });
     addLog("检验完成！", "info");
     await refreshStatus();
   });
@@ -153,7 +205,7 @@ async function startSync() {
 async function startDownload() {
   await withRunning(async () => {
     addLog(`开始下载 ${server.value} 服游戏...`, "info");
-    await invoke("start_download", { gamePath: gamePath.value || undefined, server: server.value });
+    await invoke("start_download", { gamePath: gamePath.value || undefined, server: server.value, cdnUrl: cdnUrl.value || undefined });
     addLog("下载完成！", "info");
     await refreshStatus();
   });
@@ -162,7 +214,7 @@ async function startDownload() {
 async function startUpdate() {
   await withRunning(async () => {
     addLog(`正在检查 ${server.value} 服游戏更新...`, "info");
-    await invoke("start_update", { gamePath: gamePath.value || undefined, server: server.value });
+    await invoke("start_update", { gamePath: gamePath.value || undefined, server: server.value, cdnUrl: cdnUrl.value || undefined });
     addLog("更新流程完成！", "info");
     await refreshStatus();
   });
@@ -174,6 +226,7 @@ async function startCheckout() {
     await invoke("start_checkout", {
       gamePath: gamePath.value || undefined,
       server: server.value,
+      cdnUrl: cdnUrl.value || undefined,
     });
     addLog(`已切换到 ${server.value} 服！`, "info");
     await refreshStatus();
@@ -183,7 +236,7 @@ async function startCheckout() {
 async function startPredownload() {
   await withRunning(async () => {
     addLog("开始预下载...", "info");
-    await invoke("start_predownload", { gamePath: gamePath.value || undefined, server: server.value });
+    await invoke("start_predownload", { gamePath: gamePath.value || undefined, server: server.value, cdnUrl: cdnUrl.value || undefined });
     addLog("预下载完成！", "info");
   });
 }
@@ -305,6 +358,31 @@ const progressLabel = computed(() => {
         <button class="btn-sm" @click="startCheckout" :disabled="running || !gamePath">
           ✅ 应用服务器更改
         </button>
+      </div>
+      <div class="field">
+        <label>CDN 节点:</label>
+        <div class="custom-select" ref="cdnDropdownRef" :class="{ open: cdnDropdownOpen, disabled: running }">
+          <div class="select-trigger" @click="!running && (cdnDropdownOpen = !cdnDropdownOpen)">
+            <span>{{ currentCdnLabel() }}</span>
+            <span class="arrow">&#9662;</span>
+          </div>
+          <div class="select-dropdown cdn-dropdown" v-show="cdnDropdownOpen && cdnNodes.length">
+            <div
+              v-for="n in cdnNodes"
+              :key="n.url"
+              class="select-option"
+              :class="{ active: cdnUrl === n.url }"
+              @click="selectCdn(n)"
+            >
+              <span class="cdn-host">{{ cdnHost(n.url) }}</span>
+              <span v-if="n.recommended" class="cdn-badge">推荐</span>
+              <span class="cdn-prio">优先级 {{ n.priority }}</span>
+            </div>
+          </div>
+          <div class="select-dropdown cdn-dropdown" v-show="cdnDropdownOpen && !cdnNodes.length">
+            <div class="select-option disabled-opt">无法获取 CDN 列表</div>
+          </div>
+        </div>
       </div>
     </section>
 
@@ -756,6 +834,51 @@ body {
 
 .dx-dropdown {
   min-width: 70px;
+}
+
+/* ── CDN Select ── */
+.cdn-dropdown {
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.cdn-host {
+  flex: 1;
+  word-break: break-all;
+}
+
+.cdn-badge {
+  font-size: 0.72em;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--accent);
+  color: #fff;
+  margin-left: 6px;
+  white-space: nowrap;
+}
+
+.cdn-prio {
+  font-size: 0.72em;
+  color: var(--text-muted2);
+  margin-left: 6px;
+  white-space: nowrap;
+}
+
+.select-option {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.disabled-opt {
+  color: var(--text-muted2);
+  cursor: default;
+  font-style: italic;
+}
+
+.disabled-opt:hover {
+  background: transparent;
+  color: var(--text-muted2);
 }
 
 /* ── Operations ── */

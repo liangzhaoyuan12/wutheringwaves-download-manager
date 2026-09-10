@@ -52,10 +52,26 @@ pub struct DownloadTask {
     pub size: u64,
 }
 
+/// 单个 CDN 节点信息（来自 launcher info 的 `default.cdnList`）
+#[derive(Clone, Serialize)]
+pub struct CdnNode {
+    /// 节点基址 URL
+    pub url: String,
+    /// 优先级（P 字段），数值越大越优先
+    pub priority: i64,
+    /// K1 标志
+    pub k1: i64,
+    /// K2 标志
+    pub k2: i64,
+    /// 是否为自动选择的推荐节点（K1==1 && K2==1 中优先级最高者）
+    pub recommended: bool,
+}
+
 pub struct GameManager {
     ctx: SharedCtx,
     launcher_info: Option<serde_json::Value>,
     cdn_node: Option<String>,
+    preferred_cdn: Option<String>,
     game_index: Option<serde_json::Value>,
     predownload_index_cache: Option<serde_json::Value>,
 }
@@ -65,6 +81,7 @@ impl GameManager {
         game_folder: PathBuf,
         server_type: &str,
         app_handle: tauri::AppHandle,
+        cdn_url: Option<String>,
     ) -> Result<Self, WwError> {
         let server_config = config::server_configs()
             .get(server_type)
@@ -84,6 +101,7 @@ impl GameManager {
             },
             launcher_info: None,
             cdn_node: None,
+            preferred_cdn: cdn_url,
             game_index: None,
             predownload_index_cache: None,
         })
@@ -143,35 +161,71 @@ impl GameManager {
         Ok(self.launcher_info.clone().unwrap())
     }
 
-    async fn ensure_cdn_node(&mut self) -> Result<String, WwError> {
-        if self.cdn_node.is_none() {
-            let info = self.ensure_launcher_info().await?;
-            let default_info = info
-                .get("default")
-                .ok_or_else(|| WwError::Network("launcher info 缺少 'default' 字段".into()))?;
+    /// 拉取指定服务器的 CDN 节点列表，并标注推荐节点。
+    pub async fn fetch_cdn_list(server_type: &str) -> Result<Vec<CdnNode>, WwError> {
+        let server_config = config::server_configs()
+            .get(server_type)
+            .cloned()
+            .ok_or_else(|| WwError::Config(format!("无效的服务器类型: {}", server_type)))?;
 
-            let nodes = default_info
-                .get("cdnList")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| WwError::Network("CDN 列表为空".into()))?;
+        let info = Self::fetch_json(&server_config.api_url, JSON_TIMEOUT_SECS).await?;
+        let default_info = info
+            .get("default")
+            .ok_or_else(|| WwError::Network("launcher info 缺少 'default' 字段".into()))?;
 
-            let best = nodes
-                .iter()
-                .filter(|n| {
-                    n.get("K1").and_then(|v| v.as_i64()) == Some(1)
-                        && n.get("K2").and_then(|v| v.as_i64()) == Some(1)
-                })
-                .max_by(|a, b| {
-                    let pa = a.get("P").and_then(|v| v.as_i64()).unwrap_or(0);
-                    let pb = b.get("P").and_then(|v| v.as_i64()).unwrap_or(0);
-                    pa.cmp(&pb)
-                })
-                .ok_or_else(|| WwError::Network("没有可用的 CDN 节点".into()))?;
+        let nodes = default_info
+            .get("cdnList")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| WwError::Network("CDN 列表为空".into()))?;
 
-            let url = best
+        let mut list: Vec<CdnNode> = Vec::new();
+        for n in nodes {
+            let url = n
                 .get("url")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| WwError::Network("CDN 节点缺少 url".into()))?;
+                .ok_or_else(|| WwError::Network("CDN 节点缺少 url".into()))?
+                .to_string();
+            let priority = n.get("P").and_then(|v| v.as_i64()).unwrap_or(0);
+            let k1 = n.get("K1").and_then(|v| v.as_i64()).unwrap_or(0);
+            let k2 = n.get("K2").and_then(|v| v.as_i64()).unwrap_or(0);
+            list.push(CdnNode {
+                url,
+                priority,
+                k1,
+                k2,
+                recommended: false,
+            });
+        }
+
+        // 推荐节点：K1==1 且 K2==1 中优先级最高者
+        let best_index = list
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| n.k1 == 1 && n.k2 == 1)
+            .max_by(|a, b| a.1.priority.cmp(&b.1.priority))
+            .map(|(i, _)| i);
+
+        if let Some(i) = best_index {
+            list[i].recommended = true;
+        }
+
+        Ok(list)
+    }
+
+    async fn ensure_cdn_node(&mut self) -> Result<String, WwError> {
+        if self.cdn_node.is_none() {
+            // 若用户已指定 CDN，则直接使用，否则自动选择推荐节点
+            let url = if let Some(ref preferred) = self.preferred_cdn {
+                preferred.clone()
+            } else {
+                let list = Self::fetch_cdn_list(&self.ctx.server_type).await?;
+                let best = list
+                    .iter()
+                    .filter(|n| n.k1 == 1 && n.k2 == 1)
+                    .max_by(|a, b| a.priority.cmp(&b.priority))
+                    .ok_or_else(|| WwError::Network("没有可用的 CDN 节点".into()))?;
+                best.url.clone()
+            };
 
             self.cdn_node = Some(url.to_string());
             log::info!("使用 CDN: {}", url);
@@ -331,6 +385,7 @@ impl GameManager {
                     ctx,
                     launcher_info: None,
                     cdn_node: None,
+                    preferred_cdn: None,
                     game_index: None,
                     predownload_index_cache: None,
                 };
@@ -557,6 +612,7 @@ impl GameManager {
                     ctx: ctx.clone(),
                     launcher_info: None,
                     cdn_node: None,
+                    preferred_cdn: None,
                     game_index: None,
                     predownload_index_cache: None,
                 };
