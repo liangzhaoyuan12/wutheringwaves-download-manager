@@ -137,4 +137,21 @@ impl Md5Cache {
             inner.updated = true;
         }
     }
+
+    /// 直接写入已知的 MD5（下载时流式计算得到），避免后续校验阶段重新读取整个文件。
+    /// mtime 取自当前文件，保证 `get` 能命中。
+    pub async fn set(&self, file_path: &Path, md5: String) {
+        let rel_path = match file_path.strip_prefix(&self.game_root) {
+            Ok(p) => p.to_string_lossy().replace('\\', "/"),
+            Err(_) => return,
+        };
+        let mtime = match Self::get_mtime(file_path) {
+            Some(m) => m,
+            None => return,
+        };
+
+        let mut inner = self.inner.write().await;
+        inner.entries.insert(rel_path, CacheEntry { mtime, md5 });
+        inner.updated = true;
+    }
 }

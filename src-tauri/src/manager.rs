@@ -1,3 +1,4 @@
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -11,12 +12,20 @@ use crate::error::WwError;
 use crate::md5_cache::Md5Cache;
 
 const VERIFY_CONCURRENT: usize = 64;
-const DOWNLOAD_CONCURRENT: usize = 8;
+const DOWNLOAD_CONCURRENT: usize = 20; // 并发下载的文件数（原来 8，瓶颈在此）
+const DOWNLOAD_CHUNK_TARGET: u64 = 64 * 1024 * 1024; // 大文件分块目标大小
+const DOWNLOAD_CHUNK_MIN: usize = 4;
+const DOWNLOAD_CHUNK_MAX: usize = 8; // 单个文件最多并发分块数
 const RETRY_COUNT: u32 = 3;
 const JSON_TIMEOUT_SECS: u64 = 10;
-const DOWNLOAD_READ_TIMEOUT_SECS: u64 = 60;
-const DOWNLOAD_CHUNKS: usize = 8;
-const MIN_CHUNKED_SIZE: u64 = 8 * 1024 * 1024; // files > 8MB use chunked download
+const DOWNLOAD_READ_TIMEOUT_SECS: u64 = 120;
+const MIN_CHUNKED_SIZE: u64 = 4 * 1024 * 1024; // 文件 > 4MB 走分块下载
+
+/// 根据文件大小计算分块数（目标块大小固定，文件越大分块越多）。
+fn chunk_count_for(size: u64) -> usize {
+    let n = (size + DOWNLOAD_CHUNK_TARGET - 1) / DOWNLOAD_CHUNK_TARGET;
+    n.clamp(DOWNLOAD_CHUNK_MIN as u64, DOWNLOAD_CHUNK_MAX as u64) as usize
+}
 
 #[derive(Clone, Serialize)]
 pub struct ProgressEvent {
@@ -36,6 +45,8 @@ struct SharedCtx {
     server_config: ServerConfig,
     md5_cache: Md5Cache,
     app_handle: tauri::AppHandle,
+    /// 全局复用的 HTTP 客户端（连接池 / keep-alive），避免每个文件重建连接。
+    client: reqwest::Client,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +102,10 @@ impl GameManager {
         let md5_cache =
             Md5Cache::new(game_folder.join("wwm_md5_cache.json"), game_folder.clone());
 
+        // 构建一次全局复用的下载客户端：开启连接池、TCP keep-alive、nodelay，
+        // 让大量并发请求复用已有连接，省去重复的 TCP/TLS 握手开销。
+        let client = Self::build_download_client()?;
+
         Ok(Self {
             ctx: SharedCtx {
                 game_folder: game_folder.canonicalize().unwrap_or(game_folder),
@@ -98,6 +113,7 @@ impl GameManager {
                 server_config,
                 md5_cache,
                 app_handle,
+                client,
             },
             launcher_info: None,
             cdn_node: None,
@@ -131,11 +147,15 @@ impl GameManager {
             .map_err(|e| WwError::Network(e.to_string()))
     }
 
-    async fn http_client_for_download() -> Result<reqwest::Client, WwError> {
+    /// 构建全局复用的下载客户端。仅在 GameManager::new 中调用一次。
+    fn build_download_client() -> Result<reqwest::Client, WwError> {
         reqwest::Client::builder()
             .user_agent("WW-Manager/2.0")
             .connect_timeout(std::time::Duration::from_secs(10))
             .read_timeout(std::time::Duration::from_secs(DOWNLOAD_READ_TIMEOUT_SECS))
+            .pool_max_idle_per_host(32)
+            .tcp_keepalive(std::time::Duration::from_secs(60))
+            .tcp_nodelay(true)
             .build()
             .map_err(|e| WwError::Network(e.to_string()))
     }
@@ -337,9 +357,14 @@ impl GameManager {
     ) -> Result<bool, WwError> {
         for attempt in 0..RETRY_COUNT {
             match self.attempt_download(url, temp_file, expected_size).await {
-                Ok(true) | Ok(false) => {
+                // Some(md5): 从头下载完成，携带流式计算的 MD5，直接写入缓存
+                // None: 断点续传或文件已完整，无法得到完整 MD5，清除缓存待校验阶段重算
+                Ok(md5_opt) => {
                     std::fs::rename(temp_file, dest)?;
-                    self.ctx.md5_cache.clear(dest).await;
+                    match md5_opt {
+                        Some(md5) => self.ctx.md5_cache.set(dest, md5).await,
+                        None => self.ctx.md5_cache.clear(dest).await,
+                    }
                     return Ok(true);
                 }
                 Err(e) => {
@@ -361,9 +386,10 @@ impl GameManager {
         temp_file: &Path,
         expected_size: u64,
     ) -> Result<bool, WwError> {
-        let chunk_size = (expected_size + DOWNLOAD_CHUNKS as u64 - 1) / DOWNLOAD_CHUNKS as u64;
+        let chunk_count = chunk_count_for(expected_size);
+        let chunk_size = (expected_size + chunk_count as u64 - 1) / chunk_count as u64;
         let mut chunk_paths = Vec::new();
-        for i in 0..DOWNLOAD_CHUNKS {
+        for i in 0..chunk_count {
             let start = i as u64 * chunk_size;
             let end = std::cmp::min(start + chunk_size - 1, expected_size - 1);
             if start >= expected_size {
@@ -415,17 +441,35 @@ impl GameManager {
             return Err(WwError::Network("分块下载失败，请重试。".into()));
         }
 
-        // Concatenate chunks into temp file
-        let mut final_file = std::fs::File::create(temp_file)?;
-        for chunk_path in &concat_paths {
-            if !chunk_path.exists() {
-                return Err(WwError::Network("分块文件缺失。".into()));
+        // 合并分块 + 流式计算 MD5（复用同一次读取，零额外 I/O）。
+        // 放到 spawn_blocking，避免大文件拼接长时间阻塞 async 工作线程。
+        let temp_path = temp_file.to_path_buf();
+        let md5_hex = tokio::task::spawn_blocking(move || -> Result<String, WwError> {
+            let final_file = std::fs::File::create(&temp_path)?;
+            let mut final_writer = std::io::BufWriter::with_capacity(1 << 20, final_file);
+            let mut md5_ctx = md5::Context::new();
+            let mut buf = vec![0u8; 1 << 20];
+            for chunk_path in &concat_paths {
+                if !chunk_path.exists() {
+                    return Err(WwError::Network("分块文件缺失。".into()));
+                }
+                let mut chunk_file = std::fs::File::open(chunk_path)?;
+                loop {
+                    let n = chunk_file.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    final_writer.write_all(&buf[..n])?;
+                    md5_ctx.consume(&buf[..n]);
+                }
+                drop(chunk_file);
+                let _ = std::fs::remove_file(chunk_path);
             }
-            let mut chunk_file = std::fs::File::open(chunk_path)?;
-            std::io::copy(&mut chunk_file, &mut final_file)?;
-            drop(chunk_file);
-            let _ = std::fs::remove_file(chunk_path);
-        }
+            final_writer.flush()?;
+            Ok(format!("{:x}", md5_ctx.compute()))
+        })
+        .await
+        .map_err(|e| WwError::Generic(format!("拼接任务异常: {}", e)))??;
 
         // Verify total size
         let final_size = std::fs::metadata(temp_file)?.len();
@@ -438,7 +482,7 @@ impl GameManager {
         }
 
         std::fs::rename(temp_file, dest)?;
-        self.ctx.md5_cache.clear(dest).await;
+        self.ctx.md5_cache.set(dest, md5_hex).await;
         Ok(true)
     }
 
@@ -456,8 +500,8 @@ impl GameManager {
             return Ok(true);
         }
 
+        let client = self.ctx.client.clone();
         for attempt in 0..RETRY_COUNT {
-            let client = Self::http_client_for_download().await?;
             let range_header = format!("bytes={}-{}", start, end);
 
             let resp = match client.get(url).header("Range", &range_header).send().await {
@@ -482,16 +526,18 @@ impl GameManager {
                 continue;
             }
 
-            let mut file = std::fs::File::create(chunk_path)?;
+            let file = std::fs::File::create(chunk_path)?;
+            let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
             use futures_util::StreamExt;
             let mut stream = resp.bytes_stream();
             let mut downloaded: u64 = 0;
 
             while let Some(chunk_result) = stream.next().await {
                 let chunk = chunk_result?;
-                std::io::Write::write_all(&mut file, &chunk)?;
+                writer.write_all(&chunk)?;
                 downloaded += chunk.len() as u64;
             }
+            writer.flush()?;
 
             if downloaded == expected {
                 return Ok(true);
@@ -519,18 +565,19 @@ impl GameManager {
         url: &str,
         temp_file: &Path,
         expected_size: u64,
-    ) -> Result<bool, WwError> {
+    ) -> Result<Option<String>, WwError> {
         let resume_byte = if temp_file.exists() {
             let size = std::fs::metadata(temp_file)?.len();
             if size == expected_size {
-                return Ok(false);
+                // 文件已完整，无本次流式数据可得，交由校验阶段处理
+                return Ok(None);
             }
             size
         } else {
             0
         };
 
-        let client = Self::http_client_for_download().await?;
+        let client = self.ctx.client.clone();
 
         let mut req = client.get(url);
         if resume_byte > 0 {
@@ -546,11 +593,15 @@ impl GameManager {
         }
 
         let append = resume_byte > 0;
-        let mut file = if append {
+        let file = if append {
             std::fs::OpenOptions::new().append(true).open(temp_file)?
         } else {
             std::fs::File::create(temp_file)?
         };
+        let mut writer = std::io::BufWriter::with_capacity(1 << 20, file);
+
+        // 仅在从头下载时才能流式得到完整文件的 MD5
+        let mut md5_ctx = if append { None } else { Some(md5::Context::new()) };
 
         use futures_util::StreamExt;
         let mut downloaded = resume_byte;
@@ -558,15 +609,24 @@ impl GameManager {
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result?;
-            std::io::Write::write_all(&mut file, &chunk)?;
+            writer.write_all(&chunk)?;
+            if let Some(ctx) = md5_ctx.as_mut() {
+                ctx.consume(&chunk);
+            }
             downloaded += chunk.len() as u64;
         }
+        writer.flush()?;
 
-        if downloaded >= expected_size {
-            Ok(true)
-        } else {
-            Err(WwError::Network("下载不完整".into()))
+        if downloaded < expected_size {
+            return Err(WwError::Network("下载不完整".into()));
         }
+
+        // 只有字节数精确匹配时才缓存 MD5，避免异常情况下写入错误指纹
+        Ok(if downloaded == expected_size {
+            md5_ctx.map(|ctx| format!("{:x}", ctx.compute()))
+        } else {
+            None
+        })
     }
 
     // ── batch download ──
@@ -592,6 +652,10 @@ impl GameManager {
         let completed = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut handles = Vec::new();
+
+        // 文件很多时没必要每个文件都发一次 IPC 事件（会拖慢 UI 与主进程），
+        // 这里按比例节流：少量文件逐个上报，海量文件每 20 个上报一次。
+        let emit_every = if total_count <= 200 { 1 } else { 20 };
 
         for task in tasks {
             let sem = sem.clone();
@@ -625,16 +689,18 @@ impl GameManager {
                 let n = completed
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
                     + 1;
-                let _ = ctx.app_handle.emit(
-                    "ww:progress",
-                    ProgressEvent {
-                        event_type: "download_file_done".into(),
-                        message: format!("[{}] {}", n, file_name),
-                        current: n,
-                        total: total_count,
-                        file_name: Some(file_name),
-                    },
-                );
+                if n % emit_every == 0 || n == total_count {
+                    let _ = ctx.app_handle.emit(
+                        "ww:progress",
+                        ProgressEvent {
+                            event_type: "download_file_done".into(),
+                            message: format!("[{}] {}", n, file_name),
+                            current: n,
+                            total: total_count,
+                            file_name: Some(file_name),
+                        },
+                    );
+                }
             }));
         }
 
